@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM translation of sls-bb245-sfp
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    Description: Stage for deployment (dev, prod, etc.)
+  BucketName:
+    Type: String
+    Default: example-bucket-name
+    Description: Name of the S3 bucket
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Tracing: Active
+
+Resources:
+  # S3 Bucket
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Suspended
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Function
+  ProcessS3DataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: process_s3_data.lambda_handler
+      MemorySize: 256
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: processS3Order
+          POWERTOOLS_LOG_LEVEL: INFO
+          Tracing: Active
+      Layers:
+        - arn:aws:lambda:us-east-1:XXXXXXXXXXXX:layer:AWSLambdaPowertoolsPythonV2:61
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref BucketName
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - AWSXrayWriteOnlyAccess
+
+  # Custom resource to create S3 notification after Lambda and bucket are created
+  S3NotificationCustomResource:
+    Type: Custom::S3BucketNotification
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName: !Ref S3Bucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events:
+              - s3:ObjectCreated:*
+            LambdaFunctionArn: !GetAtt ProcessS3DataFunction.Arn
+
+  # Lambda function to set up S3 notifications
+  S3NotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        import boto3
+        import cfnresponse
+        import json
+        import logging
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        def handler(event, context):
+            logger.info("Received event: %s", json.dumps(event))
+
+            # Initialize response
+            response_data = {}
+
+            try:
+                # Get properties from the event
+                props = event['ResourceProperties']
+                bucket_name = props['BucketName']
+                notification_config = props['NotificationConfiguration']
+
+                s3 = boto3.client('s3')
+
+                if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                    logger.info(f"Setting notification configuration for bucket {bucket_name}")
+
+                    # Add Lambda permissions for each Lambda function in the notification config
+                    if 'LambdaFunctionConfigurations' in notification_config:
+                        lambda_client = boto3.client('lambda')
+                        for config in notification_config['LambdaFunctionConfigurations']:
+                            lambda_arn = config['LambdaFunctionArn']
+                            lambda_name = lambda_arn.split(':')[-1]
+
+                            try:
+                                logger.info(f"Adding permission for Lambda {lambda_name}")
+                                lambda_client.add_permission(
+                                    FunctionName=lambda_name,
+                                    StatementId=f"S3-{bucket_name}-{lambda_name}",
+                                    Action='lambda:InvokeFunction',
+                                    Principal='s3.amazonaws.com',
+                                    SourceArn=f"arn:aws:s3:::{bucket_name}"
+                                )
+                            except lambda_client.exceptions.ResourceConflictException:
+                                logger.info(f"Permission already exists for Lambda {lambda_name}")
+
+                    # Set the notification configuration
+                    s3.put_bucket_notification_configuration(
+                        Bucket=bucket_name,
+                        NotificationConfiguration=notification_config
+                    )
+
+                    logger.info("Successfully set notification configuration")
+                    response_data['Message'] = "Notification configuration set successfully"
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+                elif event['RequestType'] == 'Delete':
+                    logger.info(f"Removing notification configuration for bucket {bucket_name}")
+
+                    # Remove the notification configuration
+                    s3.put_bucket_notification_configuration(
+                        Bucket=bucket_name,
+                        NotificationConfiguration={}
+                    )
+
+                    logger.info("Successfully removed notification configuration")
+                    response_data['Message'] = "Notification configuration removed successfully"
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                response_data['Error'] = str(e)
+                cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 60
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutBucketNotification
+              Resource: !Sub arn:aws:s3:::${S3Bucket}
+            - Effect: Allow
+              Action:
+                - lambda:AddPermission
+              Resource: !GetAtt ProcessS3DataFunction.Arn
+
+  # IAM Roles
+  IAMRoleForAPIGateway:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub sls-bb245-sfp-${Stage}-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Description: !Sub Role for sls-bb245-sfp-${Stage}
+      Path: /
+      Policies:
+        - PolicyName: !Sub sls-bb245-sfp-${Stage}-role-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+
+  CloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Resources
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub sls-bb245-sfp-${Stage}
+      ApiKeySourceType: HEADER
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  RestAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: api
+      RestApiId: !Ref RestAPI
+
+  RestAPIObjectPathResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref RestAPIResource
+      PathPart: '{order_object_path+}'
+      RestApiId: !Ref RestAPI
+
+  RequestBodyModelId:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref RestAPI
+      ContentType: application/json
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        title: RequestBodyModelId
+        properties:
+          orderId:
+            type: integer
+
+  RequestBodyModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref RestAPI
+      ContentType: application/json
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        title: RequestBodyModel
+        required:
+          - orderDate
+          - orderPaymentAmount
+          - orderPaymentCurrency
+          - customerId
+        type: object
+        properties:
+          orderId:
+            $ref: !Sub https://apigateway.amazonaws.com/restapis/${RestAPI}/models/${RequestBodyModelId}
+          orderDate:
+            type: string
+          orderPaymentAmount:
+            type: number
+            minimum: 0
+            maximum: 99999
+          orderPaymentCurrency:
+            type: string
+            enum:
+              - USD
+              - EUR
+              - INR
+          customerId:
+            type: integer
+            minLength: 3
+            maxLength: 7
+
+  PUTRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      Name: body-only
+      RestApiId: !Ref RestAPI
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  RestAPIPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: true
+      HttpMethod: PUT
+      AuthorizationType: AWS_IAM
+      RequestValidatorId: !Ref PUTRequestValidator
+      RequestModels:
+        application/json: !Ref RequestBodyModel
+      Integration:
+        TimeoutInMillis: 7000
+        Type: AWS
+        IntegrationHttpMethod: PUT
+        Uri: !Sub arn:aws:apigateway:us-east-1:s3:path/${BucketName}/{order_object_path}
+        Credentials: !GetAtt IAMRoleForAPIGateway.Arn
+        RequestParameters:
+          integration.request.path.order_object_path: method.request.path.order_object_path
+        IntegrationResponses:
+          - StatusCode: 200
+          - StatusCode: 400
+            SelectionPattern: 4\d{2}
+          - StatusCode: 500
+            SelectionPattern: 5\d{2}
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+      RequestParameters:
+        method.request.path.order_object_path: true
+        method.request.header.Content-Type: true
+      OperationName: write-order-data-to-s3
+      ResourceId: !Ref RestAPIObjectPathResource
+      RestApiId: !Ref RestAPI
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Error
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Error
+
+  ApiCWLRoleArn:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt CloudWatchRole.Arn
+
+  RestAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RestAPIPutMethod
+      - RequestBodyModel
+    Properties:
+      RestApiId: !Ref RestAPI
+
+  RestAPIStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiCWLRoleArn
+    Properties:
+      DeploymentId: !Ref RestAPIDeployment
+      Description: !Sub ${Stage} stage
+      RestApiId: !Ref RestAPI
+      StageName: !Ref Stage
+      Variables:
+        bucket_name: !Ref BucketName
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          MetricsEnabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - RestAPIStage
+    Properties:
+      ApiStages:
+        - ApiId: !Ref RestAPI
+          Stage: !Ref Stage
+          Throttle:
+            /api/{order_object_path+}/PUT:
+              RateLimit: 50
+              BurstLimit: 100
+      Quota:
+        Limit: 1000
+        Period: MONTH
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+      UsagePlanName: sls-spf-plan
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Description: API Key
+      Name: apigwToS3Key
+      Enabled: true
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref S3Bucket
+  ApiRootUrl:
+    Description: Root URL of the API Gateway
+    Value: !Sub https://${RestAPI}.execute-api.us-east-1.amazonaws.com/${Stage}/api/{order_object_path+}
+  ApiGKeyId:
+    Description: API Gateway Key ID
+    Value: !Ref ApiKey
+  ProcessS3DataFunction:
+    Description: ProcessS3Data Lambda Function ARN
+    Value: !GetAtt ProcessS3DataFunction.Arn
